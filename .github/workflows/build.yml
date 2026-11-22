@@ -3,13 +3,15 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+permissions:
+  contents: write
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15      # Mac con chip Apple
+          - os: macos-15
             nombre: PSD_Reportabilidad_Mac_AppleSilicon
           - os: windows-latest
             nombre: PSD_Reportabilidad_Windows
@@ -31,3 +33,16 @@ jobs:
         with:
           name: ${{ matrix.nombre }}
           path: ${{ matrix.nombre }}.zip
+  publicar:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: descargas
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Versión ${{ github.run_number }}
+          files: descargas/*.zip
