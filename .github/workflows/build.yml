@@ -9,7 +9,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14      # Mac con chip Apple (M1/M2/M3/M4)
+          - os: macos-15      # Mac con chip Apple
             nombre: PSD_Reportabilidad_Mac_AppleSilicon
           - os: windows-latest
             nombre: PSD_Reportabilidad_Windows
