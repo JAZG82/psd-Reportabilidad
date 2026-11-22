@@ -11,8 +11,6 @@ jobs:
         include:
           - os: macos-14      # Mac con chip Apple (M1/M2/M3/M4)
             nombre: PSD_Reportabilidad_Mac_AppleSilicon
-          - os: macos-13      # Mac con procesador Intel
-            nombre: PSD_Reportabilidad_Mac_Intel
           - os: windows-latest
             nombre: PSD_Reportabilidad_Windows
     runs-on: ${{ matrix.os }}
