@@ -11,10 +11,10 @@ import datetime as dt
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QComboBox,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QDoubleSpinBox, QSpinBox, QMessageBox, QSplitter, QAbstractItemView,
-    QHeaderView, QFrame)
+    QHeaderView, QFrame, QDialog, QPlainTextEdit)
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -239,6 +239,9 @@ class Ventana(QMainWindow):
         b = QPushButton("Exportar a Excel…")
         b.clicked.connect(self.exportar)
         top.addWidget(b)
+        self.btn_pend = QPushButton("Pendientes para metalurgistas…")
+        self.btn_pend.clicked.connect(self.pendientes)
+        top.addWidget(self.btn_pend)
         top.addSpacing(14)
         self.lbl_fuentes = QLabel()
         top.addWidget(self.lbl_fuentes, 1)
@@ -279,12 +282,23 @@ class Ventana(QMainWindow):
         self.p = {}
         for clave, titulo, kw in (
                 ("resumen", "Resumen", {"alto_fig": 3.4, "reparto": (2, 3), "estirar_ultima": True}), ("oper", "Operación", {"alto_fig": 6.2}),
+                ("recep", "Recepción", {"alto_fig": 6.2}), ("lotes", "Lotes", {"alto_fig": 3.6, "reparto": (2, 3), "estirar_ultima": True}),
+                ("acopio", "Acopio", {"alto_fig": 6.2}),
                 ("leyes", "Leyes", {"alto_fig": 6.2}), ("rec", "Recuperación", {}),
                 ("filt", "Filtrado", {}), ("p80", "P80", {"alto_fig": 6.2}),
                 ("reac", "Reactivos", {"alto_fig": 8.0}), ("conc", "Conciliación", {"con_fig": False, "estirar_ultima": True})):
             pg = Pagina(**kw)
             self.p[clave] = pg
             self.tabs.addTab(pg, titulo)
+        self.cb_rec = QComboBox()
+        self.cb_rec.addItems(["Día (mes en curso)", "Semana", "Mes"])
+        self.cb_rec.currentIndexChanged.connect(lambda _: self.pg_recep(self.R) if getattr(self, "R", None) else None)
+        fila = QHBoxLayout()
+        fila.setContentsMargins(6, 4, 6, 0)
+        fila.addWidget(QLabel("<b>Ver recepción por</b>"))
+        fila.addWidget(self.cb_rec)
+        fila.addStretch(1)
+        self.p["recep"].layout().insertLayout(0, fila)
         self.tabs.currentChanged.connect(lambda _: self._ajustar_actual())
         self.lbl_cob = QLabel()
         self.lbl_cob.setWordWrap(True)
@@ -358,7 +372,7 @@ class Ventana(QMainWindow):
         self.lbl_fuentes.setText("&nbsp;&nbsp;".join(partes))
         self.R = core.calcular(d, self.plan())
         R = self.R
-        for fn_ in (self.pg_resumen, self.pg_oper, self.pg_leyes, self.pg_rec,
+        for fn_ in (self.pg_resumen, self.pg_oper, self.pg_recep, self.pg_lotes, self.pg_acopio, self.pg_leyes, self.pg_rec,
                     self.pg_filt, self.pg_p80, self.pg_reac, self.pg_conc):
             fn_(R)
 
@@ -372,6 +386,22 @@ class Ventana(QMainWindow):
         return [r for r in R.dias if u and r["fecha"] <= u]
 
     # -- Resumen --------------------------------------------------------------
+    def _filas_recepcion(self, R):
+        rec = getattr(R, "rec", {"hay": False})
+        if not rec.get("hay") or not rec.get("kpi"):
+            return []
+        k = rec["kpi"]
+        prod = k["hef"] + k["otros"]
+        otros = f" + {fn(k['otros'], 0)} de {', '.join(k['productores'])}" if k["otros"] else ""
+        return [
+            ("Mineral recibido de productores (t húmedas)", fn(prod, 0), "", "",
+             f"Hefaistos {fn(k['hef'], 0)}{otros}; {k['camiones']} camiones"),
+            ("Mineral especial recibido (t húmedas)", fn(k["esp"], 0), "", "", "recuperado de derrames y barridos de cancha"),
+            ("Ley CuT del mineral recibido (%)", fn(k["ley"], 2), fn(R.plan["ley"], 2),
+             fn(k["ley"] / R.plan["ley"] * 100, 0, " %") if (k["ley"] and R.plan["ley"]) else "",
+             f"ponderada por secas; {fn(k['wet_sin_ley'], 0)} t húmedas sin ley"),
+        ]
+
     def pg_resumen(self, R):
         pg, K, pl = self.p["resumen"], R.K, R.plan
         pg.limpiar()
@@ -387,6 +417,7 @@ class Ventana(QMainWindow):
              f"{K['n_turnos_molino']} turnos con molino operando"),
             ("Horas molino (h)", fn(K["horas"], 1), "", "", "Reporte Jefe de Turno"),
             ("Rate molino (t/h)", fn(K["rate"], 1), "", "", "molido / horas operadas"),
+        ] + self._filas_recepcion(R) + [
             ("Ley cabeza CuT (%)", fn(K["cab"], 3), fn(pl["ley"], 2), fn(av(K["cab"], pl["ley"]), 0, " %"),
              f"ponderada por molido, {K['n_con_ley']} turnos con ley"),
             ("Ley cabeza CuS (%)", fn(K["cab_cus"], 3), "", "", "cobre soluble en alimentación"),
@@ -487,6 +518,169 @@ class Ventana(QMainWindow):
                           fn(r["chanc"], 0) if r["chanc"] is not None else "—"))
         pg.llenar(["Fecha", "Molido TA (t)", "Molido TB (t)", "Molido día (t)", "Horas TA", "Horas TB",
                    "Rate (t/h)", "Chancado (t)"], filas)
+        pg.dibujar()
+
+    # -- Recepción de mineral -----------------------------------------------------
+    def pg_recep(self, R):
+        pg = self.p["recep"]
+        pg.limpiar()
+        rec = getattr(R, "rec", {"hay": False})
+        a1, a2 = pg.fig.subplots(2, 1)
+        if not rec["hay"]:
+            vacio(a1, "Cargue el archivo «Recepción y lotes de chancado»")
+            vacio(a2, "")
+            pg.llenar([], [])
+            pg.dibujar()
+            return
+        modo = self.cb_rec.currentIndex()
+        plan_ley = R.plan["ley"]
+        if modo == 0:
+            P = rec["dias"]
+            x = list(range(len(P)))
+            base = [0.0] * len(P)
+            for clave, nombre, color in (("mina", "Mina · Hefaistos", BLUE), ("otros", "Mina · otros productores", AQUA),
+                                         ("esp", "Especial · derrames y barridos", VIOLET)):
+                v = [r[clave] for r in P]
+                if not any(v):
+                    continue
+                a1.bar(x, v, bottom=base, color=color, width=0.72, edgecolor=SURFACE, linewidth=1, label=nombre)
+                base = [b + y for b, y in zip(base, v)]
+            a1.set_title("Mineral recibido por día (t húmedas)")
+            a1.legend(loc="upper left", ncols=3)
+            a1.set_ylim(0, max(base) * 1.25 if base else 1)
+            eje_dias(a1, P)
+            Hover(pg.canvas, a1, [(i, base[i], f"{fd(r['fecha'])}\ntotal {fn(base[i], 0)} t · {r['camiones']} camiones\n"
+                                              f"Hefaistos {fn(r['mina'], 0)} · otros {fn(r['otros'], 0)} · especial {fn(r['esp'], 0)}")
+                                  for i, r in enumerate(P)])
+            a2.plot(x, [r["acum_rec"] for r in P], color=BLUE, marker="o", ms=3.5, label="Recibido acumulado")
+            a2.plot(x, [r["acum_mol"] for r in P], color=ORANGE, marker="o", ms=3.5, label="Molido acumulado")
+            a2.set_title("Recibido y molido acumulados del mes (t)")
+            a2.legend(loc="upper left", ncols=2)
+            eje_dias(a2, P)
+            Hover(pg.canvas, a2, [(i, r["acum_rec"], f"{fd(r['fecha'])}\nrecibido {fn(r['acum_rec'], 0)} t\nmolido {fn(r['acum_mol'], 0)} t")
+                                  for i, r in enumerate(P)])
+            filas = [(fd(r["fecha"]), str(r["camiones"]), fn(r["mina"] + r["otros"] + r["esp"], 1), fn(r["mina"], 1),
+                      fn(r["otros"], 1), fn(r["esp"], 1),
+                      fn(r["todo"]["dry"] or None, 1), fn(r["todo"]["ley"], 2),
+                      fn(r["todo"]["cu"] if r["todo"]["ley"] else None, 2), fn(r["acum_rec"], 0))
+                     for r in reversed(P)]
+            pg.llenar(["Fecha", "Camiones", "Húmedas (t)", "Hefaistos (t)", "Otros prod. (t)", "Especial (t)", "Secas (t)", "CuT % pond.",
+                       "Cu fino (t)", "Recibido acum. (t)"], filas)
+        else:
+            P = rec["semanas"][-26:] if modo == 1 else rec["meses"]
+            x = list(range(len(P)))
+            etq = [fd(r["clave"]) if modo == 1 else r["etiqueta"] for r in P]
+            a1.bar(x, [r["wet"] for r in P], color=BLUE, width=0.72)
+            a1.set_title("Mineral recibido por " + ("semana, desde el lunes (t húmedas)" if modo == 1 else "mes (t húmedas)"))
+            ticks = x if len(x) <= 14 else x[::2]
+            for a in (a1, a2):
+                a.set_xticks(ticks)
+                a.set_xticklabels([etq[i] for i in ticks], rotation=0 if modo == 2 else 45, ha="center" if modo == 2 else "right")
+                a.set_xlim(-0.8, len(P) - 0.2)
+            Hover(pg.canvas, a1, [(i, r["wet"], f"{etq[i]}\n{fn(r['wet'], 0)} t · {r['camiones']} camiones") for i, r in enumerate(P)])
+            ys = [r["ley"] if r["ley"] else NAN for r in P]
+            a2.plot(x, ys, color=C_CAB, marker="o", ms=4.5, mec=SURFACE, mew=1)
+            linea_plan(a2, plan_ley, f"Plan {fn(plan_ley, 2)} %")
+            a2.set_title("Ley CuT ponderada por toneladas secas (%, solo lotes con ley y humedad)")
+            Hover(pg.canvas, a2, [(i, v, f"{etq[i]}\nCuT {fn(v, 2)} %") for i, v in enumerate(ys) if v == v])
+            filas = [(etq[i], str(r["camiones"]), fn(r["wet"], 1), fn(r["dry"] or None, 1), fn(r["ley"], 2),
+                      fn(r["cu"] if r["ley"] else None, 2), fn(r["wet_sin_ley"], 1)) for i, r in reversed(list(enumerate(P)))]
+            pg.llenar(["Período", "Camiones", "Húmedas (t)", "Secas (t)", "CuT % pond.", "Cu fino (t)", "Húmedas sin ley (t)"], filas)
+        pg.dibujar()
+
+    # -- Lotes recibidos -------------------------------------------------------------
+    def pg_lotes(self, R):
+        pg = self.p["lotes"]
+        pg.limpiar()
+        rec = getattr(R, "rec", {"hay": False})
+        ax = pg.fig.subplots(1, 1)
+        if not rec["hay"]:
+            vacio(ax, "Cargue el archivo «Recepción y lotes de chancado»")
+            pg.llenar([], [])
+            pg.dibujar()
+            return
+        L = sorted(rec["lotes"], key=lambda l: (l["fecha"] or l["fecha_ult"], l["lote"]))
+        x = list(range(len(L)))
+        con = [(i, l) for i, l in enumerate(L) if l["cut"]]
+        col = [VIOLET if l["clase"] == "Especial" else (BLUE if l["productor"] == "Hefaistos" else AQUA) for _, l in con]
+        ax.bar([i for i, _ in con], [l["cut"] for _, l in con], color=col, width=0.72)
+        sin = [i for i, l in enumerate(L) if not l["cut"]]
+        if sin:
+            ax.plot(sin, [0.04] * len(sin), "x", color=RED, ms=6, label=f"Sin ley en el Log ({len(sin)}): se marcan con una cruz roja")
+            top = max([l["cut"] for _, l in con] + [R.plan["ley"]]) * 1.22
+            ax.set_ylim(0, top)
+            ax.legend(loc="upper right")
+        linea_plan(ax, R.plan["ley"], f"Plan {fn(R.plan['ley'], 2)} %")
+        ax.set_title("Ley CuT por lote recibido en el mes (%) · azul Hefaistos, verde otros productores, violeta especial")
+        ax.set_xticks(x[::2] if len(x) > 30 else x)
+        ax.set_xticklabels([L[i]["lote"].replace("Lote ", "") .replace("Especial ", "E") for i in (x[::2] if len(x) > 30 else x)],
+                           fontsize=7)
+        ax.set_xlim(-0.8, len(L) - 0.2)
+        Hover(pg.canvas, ax, [(i, l["cut"], f"{l['lote']} · {fd(l['fecha'])}\nCuT {fn(l['cut'], 2)} % · {fn(l['wet'], 0)} t")
+                              for i, l in con])
+        filas, colores = [], []
+        for l in rec["lotes"]:
+            filas.append((l["lote"], l["productor"], l["met"] or "—", fd(l["fecha"]),
+                          str(l["camiones"]) if l["camiones"] else "—", fn(l["wet"], 2), fn(l["hum"], 2), fn(l["dry"], 2),
+                          fn(l["cut"], 2), fn(l["cus"], 2), fn(l["ag"], 1), l["estado"] or l["tipo"] or "", l["coment"] or ""))
+            colores.append("#fde8d8" if not l["cut"] else (None if l["cut"] >= R.plan["ley"] else "#fff3cf"))
+        pg.llenar(["Lote", "Productor / origen", "N° Met", "Fecha", "Camiones", "Húmedas (t)", "Humedad %", "Secas (t)",
+                   "CuT %", "CuS %", "Ag g/t", "Estado / tipo", "Observación"], filas, colores)
+        pg.dibujar()
+
+    # -- Acopio (stock reportado por el Jefe de Turno) ---------------------------------
+    def pg_acopio(self, R):
+        pg = self.p["acopio"]
+        pg.limpiar()
+        rec = getattr(R, "rec", {"hay": False})
+        a1, a2 = pg.fig.subplots(2, 1)
+        st = rec.get("stock") or []
+        if not st:
+            vacio(a1, "Sin stock reportado: cargue el Reporte de Jefe de Turno")
+            vacio(a2, "")
+            pg.llenar([], [])
+            pg.dibujar()
+            return
+        x = list(range(len(st)))
+        base = [0.0] * len(st)
+        for clave, nombre, color in (("pila_mina", "Pila molienda · mina", BLUE), ("pila_esp", "Pila molienda · especial", VIOLET),
+                                     ("cancha_mina", "Cancha chancado · mina", BLUE_LIGHT), ("cancha_esp", "Cancha chancado · especial", MAGENTA)):
+            v = [r[clave] for r in st]
+            a1.bar(x, v, bottom=base, color=color, width=0.72, edgecolor=SURFACE, linewidth=0.8, label=nombre)
+            base = [b + y for b, y in zip(base, v)]
+        a1.set_title("Stock de mineral reportado por turno (t)")
+        a1.legend(loc="upper left", ncols=2)
+        eje_turnos(a1, st, 3)
+        Hover(pg.canvas, a1, [(i, r["total"], f"{fd(r['fecha'])} {r['turno']}\ntotal {fn(r['total'], 0)} t\npila {fn(r['pila_mina'] + r['pila_esp'], 0)} · cancha {fn(r['cancha_mina'] + r['cancha_esp'], 0)}")
+                              for i, r in enumerate(st)])
+        # variación del stock vs recibido − molido (orientativo)
+        dias = rec["dias"]
+        por_dia = {}
+        for r in st:
+            por_dia[r["fecha"]] = r["total"]          # el último turno del día (TB) manda
+        f0 = min(por_dia)
+        d0 = next(r for r in dias if r["fecha"] == f0)
+        con_mol = [r["fecha"] for r in R.dias if r["mol_ta"] + r["mol_tb"] > 0]
+        f_mol = max(con_mol) if con_mol else f0
+        esp, rep, dd = [], [], []
+        for r in dias:
+            if r["fecha"] in por_dia and f0 <= r["fecha"] <= f_mol:
+                dd.append(r)
+                esp.append((r["acum_rec"] - d0["acum_rec"]) - (r["acum_mol"] - d0["acum_mol"]))
+                rep.append(por_dia[r["fecha"]] - por_dia[f0])
+        xx = list(range(len(dd)))
+        a2.plot(xx, esp, color=ORANGE, marker="o", ms=3.5, label="Esperada: recibido − molido")
+        a2.plot(xx, rep, color=BLUE, marker="o", ms=3.5, label="Reportada: variación del stock")
+        a2.axhline(0, color=PLAN, lw=1)
+        a2.legend(loc="lower right", bbox_to_anchor=(1.0, 1.0), ncols=2)
+        a2.set_title(f"Variación del stock entre el {fd(f0)} y el {fd(f_mol)}, último día con molienda cargada (t) · orientativa")
+        eje_dias(a2, dd)
+        Hover(pg.canvas, a2, [(i, rep[i], f"{fd(dd[i]['fecha'])}\nreportada {fn(rep[i], 0)} t\nesperada {fn(esp[i], 0)} t") for i in xx])
+        filas = [(fd(r["fecha"]), r["turno"], fn(r["cancha_mina"], 1), r["txt"]["cancha_mina"], fn(r["cancha_esp"], 1), r["txt"]["cancha_esp"],
+                  fn(r["pila_mina"], 1), r["txt"]["pila_mina"], fn(r["pila_esp"], 1), r["txt"]["pila_esp"], fn(r["total"], 1))
+                 for r in reversed(st)]
+        pg.llenar(["Fecha", "Turno", "Cancha mina (t)", "Lotes", "Cancha especial (t)", "Lotes", "Pila mina (t)", "Lotes",
+                   "Pila especial (t)", "Lotes", "Total (t)"], filas)
         pg.dibujar()
 
     # -- Leyes ----------------------------------------------------------------
@@ -676,6 +870,42 @@ class Ventana(QMainWindow):
         pg.tabla.setColumnWidth(1, 260)
 
     # -- Exportar ---------------------------------------------------------------
+    def pendientes(self):
+        if self.R is None:
+            QMessageBox.information(self, "Pendientes", "Cargue archivos primero.")
+            return
+        hoy = dt.date.today()
+        prox = core.proximo_miercoles(hoy)
+        aviso = ("HOY es miércoles: corresponde enviar el listado." if prox == hoy
+                 else f"Próximo envío: miércoles {fd(prox)}.")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Pendientes para metalurgistas")
+        dlg.resize(760, 640)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"<b>{aviso}</b> El texto es editable antes de copiar o guardar."))
+        ed = QPlainTextEdit(core.mensaje_pendientes(self.R, hoy))
+        ed.setFont(QFont("Menlo" if sys.platform == "darwin" else "Consolas", 10))
+        lay.addWidget(ed, 1)
+        fila = QHBoxLayout()
+        bc = QPushButton("Copiar al portapapeles")
+        bc.clicked.connect(lambda: QApplication.clipboard().setText(ed.toPlainText()))
+        bg = QPushButton("Guardar .txt…")
+        def guardar():
+            ruta, _ = QFileDialog.getSaveFileName(
+                dlg, "Guardar listado", f"Pendientes_PSD_{hoy.strftime('%d-%m-%y')}.txt", "Texto (*.txt)")
+            if ruta:
+                with open(ruta, "w", encoding="utf-8") as fh:
+                    fh.write(ed.toPlainText())
+        bg.clicked.connect(guardar)
+        bx = QPushButton("Cerrar")
+        bx.clicked.connect(dlg.accept)
+        for w in (bc, bg):
+            fila.addWidget(w)
+        fila.addStretch(1)
+        fila.addWidget(bx)
+        lay.addLayout(fila)
+        dlg.exec()
+
     def exportar(self):
         if not self.R:
             return
@@ -691,7 +921,7 @@ class Ventana(QMainWindow):
         ws.append([pg.horizontalHeaderItem(j).text() for j in range(pg.columnCount())])
         for i in range(pg.rowCount()):
             ws.append([pg.item(i, j).text() for j in range(pg.columnCount())])
-        for nombre, pagina in (("Operación", "oper"), ("Leyes", "leyes"), ("Recuperación", "rec"),
+        for nombre, pagina in (("Operación", "oper"), ("Recepción", "recep"), ("Lotes recibidos", "lotes"), ("Acopio", "acopio"), ("Leyes", "leyes"), ("Recuperación", "rec"),
                                ("Filtrado lotes", "filt"), ("P80", "p80"), ("Reactivos", "reac"), ("Conciliación", "conc")):
             t = self.p[pagina].tabla
             if t.columnCount() == 0:

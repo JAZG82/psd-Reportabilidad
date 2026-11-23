@@ -62,6 +62,8 @@ def fmt_fecha(d):
 
 def tipo_archivo(wb):
     n = set(wb.sheetnames)
+    if "Registro-Lotes" in n:
+        return "recepcion"
     if "Log Muestras" in n:
         return "log"
     if "Ingresar Datos" in n:
@@ -79,6 +81,7 @@ NOMBRES = {
     "log": "Log de Muestras (leyes)",
     "control": "Control Muestras (asignación)",
     "jefe": "Reporte Jefe de Turno",
+    "recepcion": "Recepción y lotes de chancado",
     "p80": "P80 granulometría",
     "oficial": "Filtrado oficial (V-S humedad)",
 }
@@ -86,6 +89,57 @@ NOMBRES = {
 
 # ------------------------------------------------------------------- datos
 RE_MET = re.compile(r"MET[-\s]*(\d+)")
+
+
+RE_LOTE = re.compile(r"LOTE\s*(\d+)")
+
+
+def _t(v):
+    """Toneladas: las hojas antiguas están en kg y las recientes en t."""
+    if v is None:
+        return None
+    return v / 1000.0 if abs(v) > 1000 else v
+
+
+def _fecha_valida(v):
+    if isinstance(v, dt.datetime):
+        v = v.date()
+    return v if isinstance(v, dt.date) and v.year >= 2025 else None
+
+
+def leer_registro(ws):
+    """Registro-Lotes: cada lote ocupa un bloque Bruto / Tara / NETO con una fila de fechas por camión.
+    Hay dos disposiciones (kg antigua y t reciente); se detecta por la fila 'Bruto'."""
+    maxc = 60
+    rows = list(ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=maxc, values_only=True))
+    lotes, camiones = {}, []
+    for i, r in enumerate(rows):
+        if not (isinstance(r[4], str) and r[4].strip().lower() == "bruto") or i + 2 >= len(rows):
+            continue
+        rt, rn = rows[i + 1], rows[i + 2]
+        if not (str(rt[4]).strip().lower() == "tara" and str(rn[4]).strip().lower() == "neto"):
+            continue
+        k_lote = next((k for k in (i, i - 1) if isinstance(rows[k][0], str) and RE_LOTE.search(rows[k][0].upper())), None)
+        if k_lote is None:
+            continue
+        n = int(RE_LOTE.search(rows[k_lote][0].upper()).group(1))
+        k_fecha = next((k for k in (i - 1, i - 2, i - 3)
+                        if k >= 0 and any(isinstance(x, dt.datetime) for x in rows[k][5:])), None)
+        fechas = rows[k_fecha][5:] if k_fecha is not None else []
+        est, tipo = rows[k_lote][3], rows[k_lote][2]
+        lotes[n] = dict(lote=n, estado=est if isinstance(est, str) else None,
+                        tipo=tipo if isinstance(tipo, str) else None)
+        for j in range(5, maxc):
+            b, ta, ne = num(r[j]), num(rt[j]), num(rn[j])
+            if not b and not ne:
+                continue
+            f = fechas[j - 5] if j - 5 < len(fechas) else None
+            camiones.append(dict(lote=n, n=j - 4, fecha=_fecha_valida(f), bruto=_t(b), tara=_t(ta), neto=_t(ne)))
+    return lotes, camiones
+
+
+def _semana(f):
+    return f - dt.timedelta(days=f.weekday())
 
 
 class Datos:
@@ -99,6 +153,16 @@ class Datos:
         self.codigos_raros = []
         self.avisos_cons = []
         self.mes = None
+        self.log_txt = {}                 # ID de muestra (texto) -> ley, para códigos antiguos que no son Met-N
+        self.log_en_recepcion = False     # las leyes salen de la copia del Log dentro del archivo de recepción
+        self.reg_lotes = {}               # lotes de Registro-Lotes (mina)
+        self.reg_camiones = []            # camiones: lote, fecha, bruto, tara, neto
+        self.rec_terceros = {}            # lotes de otros productores (hoja %)
+        self.rec_resumen = {}             # N° lote -> MET, toneladas, %H, comentario (hoja RESUMEN)
+        self.interno = []                 # lotes especiales (hoja Mineral Interno)
+        self.rec_lotes = []
+        self.rec_regs = []
+        self.rec_alertas = []
         self.oficial = []                 # lotes oficiales (filtrado V-S humedad)
         self.p80_ro = []                  # P80 rougher
         self.p80_cn = []                  # P80 concentrado
@@ -111,7 +175,7 @@ class Datos:
         tipo = tipo_archivo(wb)
         if tipo is None:
             raise ValueError("No reconozco este archivo: hojas = " + ", ".join(wb.sheetnames[:6]))
-        {"log": self._log, "control": self._control, "jefe": self._jefe,
+        {"log": self._log, "control": self._control, "jefe": self._jefe, "recepcion": self._recepcion,
          "p80": self._p80, "oficial": self._oficial}[tipo](wb)
         self.fuentes[tipo] = ruta.replace("\\", "/").split("/")[-1]
         return tipo
@@ -157,6 +221,30 @@ class Datos:
                   ("colchon", ("colch",)),
                   ("m100_molino", ("-#100 molino 04",)))
 
+    STOCK_ETIQ = (("mina cancha", "cancha_mina"), ("especial cancha", "cancha_esp"),
+                  ("mina pila", "pila_mina"), ("especial pila", "pila_esp"))
+
+    def _jefe_stock(self, ws, d):
+        """Bloque 'STOCK MINERALES TA/TB': lotes y toneladas en cancha de chancado y pila de molienda."""
+        turno_act = None
+        for r in range(170, min(ws.max_row, 215) + 1):
+            k = ws.cell(r, 11).value
+            if not isinstance(k, str):
+                continue
+            kk = k.strip().lower()
+            if kk.startswith("stock minerales"):
+                turno_act = "TA" if kk.endswith("ta") else ("TB" if kk.endswith("tb") else None)
+                continue
+            if turno_act is None:
+                continue
+            clave = next((c for et, c in self.STOCK_ETIQ if et in " ".join(kk.split())), None)
+            if clave is None:
+                continue
+            x = self.turnos[(d, turno_act)]
+            x["stk_" + clave] = num(ws.cell(r, 15).value)
+            lot = ws.cell(r, 14).value
+            x["stk_txt_" + clave] = "" if lot is None else str(lot).strip()
+
     def _jefe_hojas_diarias(self, wb):
         for nombre in wb.sheetnames:
             if not re.fullmatch(r"\(\d+\)", nombre):
@@ -169,6 +257,7 @@ class Datos:
                     break
             if d is None:
                 continue
+            self._jefe_stock(ws, d)
             turno_act, col_act = None, None
             for r in range(15, min(ws.max_row, 160) + 1):
                 for c in (5, 7):
@@ -191,15 +280,47 @@ class Datos:
                 if vals:
                     self.turnos[(d, turno_act)][clave] = sum(vals) / len(vals)
 
+    # -- Recepción de mineral y lotes de chancado -----------------------------------
+    def _recepcion(self, wb):
+        self.reg_lotes, self.reg_camiones = leer_registro(wb["Registro-Lotes"])
+        self.rec_resumen = {}
+        if "RESUMEN" in wb.sheetnames:
+            for r in wb["RESUMEN"].iter_rows(min_row=4, values_only=True):
+                if len(r) > 11 and isinstance(r[1], str) and RE_LOTE.search(r[1].upper()):
+                    self.rec_resumen[int(RE_LOTE.search(r[1].upper()).group(1))] = dict(
+                        met=str(r[0]).strip() if r[0] is not None else None, ton=num(r[2]),
+                        hum=num(r[3]), coment=r[11] if isinstance(r[11], str) else None)
+        self.rec_terceros = {}
+        if "%" in wb.sheetnames:
+            for r in wb["%"].iter_rows(min_row=3, values_only=True):
+                if len(r) > 11 and isinstance(r[1], str) and RE_LOTE.search(r[1].upper()) and r[11]:
+                    self.rec_terceros[int(RE_LOTE.search(r[1].upper()).group(1))] = dict(
+                        met=str(r[0]).strip() if r[0] else None, ton=num(r[2]), hum=num(r[3]),
+                        productor=str(r[11]).strip())
+        self.interno = []
+        if "Mineral Interno" in wb.sheetnames:
+            for r in wb["Mineral Interno"].iter_rows(min_row=6, values_only=True):
+                f = _fecha_valida(r[1]) if len(r) > 11 else None
+                if f and num(r[5]):
+                    self.interno.append(dict(fecha=f, met=str(r[2]).strip() if r[2] else None, lote=r[3], estado=r[4],
+                                             wet=num(r[5]), hum=num(r[6]), coment=r[11]))
+        if not self.log and "Log Muestras" in wb.sheetnames:
+            self._log(wb)                       # copia del Log dentro del archivo, solo si no se cargó el Log
+            self.log_en_recepcion = True
+
     # -- Log de Muestras: leyes por N° Met (la repetición "Rep" tiene prioridad) ----
     def _log(self, wb):
         ws = wb["Log Muestras"]
         simples, reps = {}, defaultdict(list)
+        self.log_txt = {}
+        self.log_en_recepcion = False
         for row in ws.iter_rows(min_row=4, values_only=True):
             if len(row) < 42 or row[1] is None:
                 continue
             m = RE_MET.search(str(row[1]).upper())
             if not m:
+                if "REP" not in str(row[1]).upper():
+                    self.log_txt[str(row[1]).strip().upper()] = dict(cut=num(row[39]), cus=num(row[40]), ag=num(row[41]))
                 continue
             n = int(m.group(1))
             v = dict(cut=num(row[39]), cus=num(row[40]), ag=num(row[41]))
@@ -249,6 +370,9 @@ class Datos:
         base = max(fechas) if fechas else None
         if base is None and self.asignacion:
             base = max(a["fecha"] for a in self.asignacion if any(a[k] for k in ("cab", "conc", "rel")))
+        if base is None:
+            fr = [c["fecha"] for c in self.reg_camiones if c["fecha"]] + [i["fecha"] for i in self.interno]
+            base = max(fr) if fr else None
         self.mes = (base.year, base.month) if base else None
         enmes = lambda f: self.mes is None or (f.year, f.month) == self.mes
         for x in self.turnos.values():
@@ -288,6 +412,71 @@ class Datos:
                                    wet=o["wet"], hum=hum, dry=dry,
                                    cut=v.get("cut"), cus=v.get("cus"), ag=v.get("ag")))
 
+        self._consolidar_recepcion()
+
+    def _ley_de(self, codigo):
+        if not codigo:
+            return {}
+        up = str(codigo).strip().upper()
+        m = RE_MET.search(up)
+        if m:
+            return self.log.get(int(m.group(1)), {})
+        return self.log_txt.get(up, {})
+
+    def _consolidar_recepcion(self):
+        """Lotes recibidos (mina: camión a camión; especial: hoja Mineral Interno) con la ley del Log."""
+        self.rec_lotes, self.rec_regs, self.rec_alertas = [], [], []
+        por_lote = defaultdict(list)
+        for c in self.reg_camiones:
+            por_lote[c["lote"]].append(c)
+        for n, info in sorted(self.reg_lotes.items()):
+            cs = por_lote.get(n, [])
+            netos = []
+            for c in cs:
+                ne = c["neto"]
+                if c["bruto"] and c["tara"] is not None and ne is not None and abs(c["bruto"] - c["tara"] - ne) > 0.05:
+                    self.rec_alertas.append(("neto", n, c["n"], c["fecha"], c["bruto"], c["tara"], ne))
+                if ne is None and c["bruto"] and c["tara"] is not None:
+                    ne = c["bruto"] - c["tara"]
+                netos.append(ne or 0.0)
+            wet = sum(netos)
+            if wet <= 0:
+                continue
+            ter = self.rec_terceros.get(n)
+            res = dict(self.rec_resumen.get(n, {}))
+            if ter:
+                for k in ("met", "hum"):
+                    if res.get(k) is None:
+                        res[k] = ter.get(k)
+            productor = ter["productor"] if ter else "Hefaistos"
+            hum = res.get("hum")
+            hum = hum * 100 if (hum is not None and hum <= 1) else hum
+            ley = self._ley_de(res.get("met"))
+            fechas = [c["fecha"] for c in cs if c["fecha"]]
+            lote = dict(lote=f"Lote {n:03d}", clase="Mina", productor=productor, n=n, met=res.get("met"), wet=wet, hum=hum,
+                        dry=wet * (1 - hum / 100) if hum is not None else None,
+                        cut=ley.get("cut"), cus=ley.get("cus"), ag=ley.get("ag"),
+                        fecha=min(fechas) if fechas else None, fecha_ult=max(fechas) if fechas else None,
+                        camiones=len(cs), sin_fecha=sum(1 for c in cs if not c["fecha"]),
+                        estado=info["estado"], tipo=info["tipo"], coment=res.get("coment"),
+                        ton_resumen=res.get("ton"))
+            self.rec_lotes.append(lote)
+            for c, ne in zip(cs, netos):
+                if c["fecha"] and ne > 0:
+                    self.rec_regs.append(dict(fecha=c["fecha"], clase="Mina", productor=productor, wet=ne, hum=hum,
+                                              cut=lote["cut"], lote=lote["lote"], camion=1))
+        for it in self.interno:
+            ley = self._ley_de(it["met"])
+            hum = it["hum"] * 100 if (it["hum"] is not None and it["hum"] <= 1) else it["hum"]
+            lote = dict(lote=f"Especial {it['lote']}", clase="Especial", productor="Recuperado (derrames y barridos)", n=None, met=it["met"], wet=it["wet"], hum=hum,
+                        dry=it["wet"] * (1 - hum / 100) if hum is not None else None,
+                        cut=ley.get("cut"), cus=ley.get("cus"), ag=ley.get("ag"),
+                        fecha=it["fecha"], fecha_ult=it["fecha"], camiones=None, sin_fecha=0,
+                        estado=it["estado"], tipo="Especial", coment=it["coment"], ton_resumen=None)
+            self.rec_lotes.append(lote)
+            self.rec_regs.append(dict(fecha=it["fecha"], clase="Especial", productor="Recuperado (derrames y barridos)", wet=it["wet"], hum=hum,
+                                      cut=lote["cut"], lote=lote["lote"], camion=0))
+
     # -- P80 -----------------------------------------------------------------
     def _p80(self, wb):
         ws = wb["Concentrado"]
@@ -320,6 +509,124 @@ class Datos:
                 self.oficial.append(dict(
                     fecha=d, turno=t, met=str(ws.cell(r, 5).value).strip(),
                     wet=wet, hum=num(ws.cell(r, 7).value), dry=num(ws.cell(r, 8).value)))
+
+
+
+MESES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"]
+
+
+def _agr(regs):
+    wet = sum(r["wet"] for r in regs)
+    ok = [r for r in regs if r["hum"] is not None and r["cut"]]
+    sec = lambda r: r["wet"] * (1 - r["hum"] / 100)
+    dry_ok = sum(sec(r) for r in ok)
+    cu = sum(sec(r) * r["cut"] / 100 for r in ok)
+    return dict(camiones=sum(r["camion"] for r in regs), wet=wet,
+                dry=sum(sec(r) for r in regs if r["hum"] is not None),
+                wet_sin_ley=sum(r["wet"] for r in regs if not r["cut"]),
+                cu=cu, ley=cu / dry_ok * 100 if dry_ok else None, dry_con_ley=dry_ok)
+
+
+def calcular_recepcion(d, R):
+    """Recepción de mineral: por día, semana y mes; lotes con ley; stock reportado por el Jefe de Turno."""
+    rec = dict(hay=bool(d.rec_lotes), alertas=[])
+    R.rec = rec
+    if not d.rec_lotes:
+        return
+    mes = d.mes
+    enmes = lambda f: f is not None and (mes is None or (f.year, f.month) == mes)
+    regs_mes = [r for r in d.rec_regs if enmes(r["fecha"])]
+    # --- por día del mes (hasta el último día con recepción o molienda)
+    ultimos = [r["fecha"] for r in regs_mes] + ([R.K["ultimo_dia"]] if R.K.get("ultimo_dia") else [])
+    dias = []
+    if mes and ultimos:
+        f0, f1 = dt.date(mes[0], mes[1], 1), max(ultimos)
+        mol = {x["fecha"]: x["mol_ta"] + x["mol_tb"] for x in R.dias}
+        acum_r = acum_m = 0.0
+        f = f0
+        while f <= f1:
+            dm = _agr([r for r in regs_mes if r["fecha"] == f and r["clase"] == "Mina" and r["productor"] == "Hefaistos"])
+            do = _agr([r for r in regs_mes if r["fecha"] == f and r["clase"] == "Mina" and r["productor"] != "Hefaistos"])
+            de = _agr([r for r in regs_mes if r["fecha"] == f and r["clase"] == "Especial"])
+            acum_r += dm["wet"] + do["wet"] + de["wet"]
+            acum_m += mol.get(f, 0.0)
+            dias.append(dict(fecha=f, mina=dm["wet"], otros=do["wet"], esp=de["wet"], camiones=dm["camiones"] + do["camiones"],
+                             todo=_agr([r for r in regs_mes if r["fecha"] == f]), acum_rec=acum_r, acum_mol=acum_m))
+            f += dt.timedelta(days=1)
+    rec["dias"] = dias
+    # --- semanas y meses (toda la historia con fecha)
+    sem, mes_h = defaultdict(list), defaultdict(list)
+    for r in d.rec_regs:
+        sem[_semana(r["fecha"])].append(r)
+        mes_h[(r["fecha"].year, r["fecha"].month)].append(r)
+    rec["semanas"] = [dict(clave=k, **_agr(v)) for k, v in sorted(sem.items())]
+    rec["meses"] = [dict(clave=k, etiqueta=f"{MESES[k[1] - 1]}-{str(k[0])[2:]}", **_agr(v)) for k, v in sorted(mes_h.items())]
+    rec["kpi"] = _agr(regs_mes)
+    rec["kpi"]["lotes"] = len({r["lote"] for r in regs_mes})
+    rec["kpi"]["hef"] = sum(r["wet"] for r in regs_mes if r["clase"] == "Mina" and r["productor"] == "Hefaistos")
+    rec["kpi"]["otros"] = sum(r["wet"] for r in regs_mes if r["clase"] == "Mina" and r["productor"] != "Hefaistos")
+    rec["kpi"]["esp"] = sum(r["wet"] for r in regs_mes if r["clase"] == "Especial")
+    rec["kpi"]["productores"] = sorted({r["productor"] for r in regs_mes if r["clase"] == "Mina" and r["productor"] != "Hefaistos"})
+    rec["kpi"]["total_wet"] = sum(r["wet"] for r in d.rec_regs)
+    # --- lotes del mes (tabla)
+    lotes = [l for l in d.rec_lotes if enmes(l["fecha"]) or enmes(l["fecha_ult"])]
+    rec["lotes"] = sorted(lotes, key=lambda l: (l["fecha"] or dt.date(1970, 1, 1), l["lote"]), reverse=True)
+    rec["lotes_todos"] = sorted(d.rec_lotes, key=lambda l: (l["fecha"] or dt.date(1970, 1, 1), l["lote"]))
+    # --- stock reportado por el Jefe de Turno
+    stock = []
+    for (f, t), x in sorted(d.turnos.items()):
+        if not enmes(f):
+            continue
+        vals = [x.get("stk_" + k) for k in ("cancha_mina", "cancha_esp", "pila_mina", "pila_esp")]
+        if all(v is None for v in vals):
+            continue
+        stock.append(dict(fecha=f, turno=t, cancha_mina=vals[0] or 0.0, cancha_esp=vals[1] or 0.0,
+                          pila_mina=vals[2] or 0.0, pila_esp=vals[3] or 0.0,
+                          total=sum(v or 0.0 for v in vals),
+                          txt={k: x.get("stk_txt_" + k, "") for k in ("cancha_mina", "cancha_esp", "pila_mina", "pila_esp")}))
+    rec["stock"] = stock
+    # --- conciliación de recepción
+    nm = lambda f_: f_ is not None
+    sin_ley = [l for l in lotes if not l["cut"]]
+    if sin_ley:
+        t = sum(l["wet"] for l in sin_ley)
+        R.issues.append(("media", "Lotes recibidos sin ley en el Log",
+                         f"{len(sin_ley)} lotes ({fx(t)} t húmedas): " + ", ".join(l["lote"] for l in sorted(sin_ley, key=lambda z: z["lote"]))))
+    sin_met = [l for l in lotes if l["clase"] == "Mina" and not l["met"]]
+    if sin_met:
+        R.issues.append(("media", "Lotes recibidos sin N° Met asignado",
+                         ", ".join(l["lote"] for l in sin_met) + " (aún sin muestra en la hoja RESUMEN)"))
+    sin_hum = [l for l in lotes if l["hum"] is None]
+    if sin_hum:
+        R.issues.append(("baja", "Lotes sin humedad",
+                         "No se calcula toneladas secas ni fino: " + ", ".join(l["lote"] for l in sin_hum)))
+    if d.reg_lotes:
+        n_max = max(d.reg_lotes)
+        sin_f = defaultdict(list)
+        for c_ in d.reg_camiones:
+            if c_["fecha"] is None and c_["lote"] >= n_max - 100:
+                sin_f[c_["lote"]].append(c_)
+        if sin_f:
+            tt = sum((c_["neto"] or 0) for v in sin_f.values() for c_ in v)
+            nc = sum(len(v) for v in sin_f.values())
+            prod = lambda n_: d.rec_terceros[n_]["productor"] if n_ in d.rec_terceros else None
+            R.issues.append(("alta", "Camiones sin fecha de recepción en Registro-Lotes",
+                             f"{nc} camiones ({fx(tt)} t) no entran en la recepción por día, semana ni mes. Lotes: "
+                             + ", ".join(f"{n_:03d} ({len(v)})" + (f" {prod(n_)}" if prod(n_) else "") for n_, v in sorted(sin_f.items()))))
+    for tipo, n, cam, f, b, ta, ne in d.rec_alertas:
+        if f is None or enmes(f):
+            lote = next((l for l in lotes if l["n"] == n), None)
+            if f is None and lote is None:
+                continue
+            R.issues.append(("alta", "Neto ≠ bruto − tara",
+                             f"Lote {n:03d} camión {cam}: bruto {fx(b, 2)} − tara {fx(ta, 2)} = {fx(b - ta, 2)} t, pero el neto dice {fx(ne, 2)} t"))
+    for l in lotes:
+        if l["clase"] == "Mina" and l["ton_resumen"] is not None and abs(l["ton_resumen"] - l["wet"]) > 0.5:
+            R.issues.append(("media", "Registro-Lotes ≠ RESUMEN",
+                             f"{l['lote']}: camiones suman {fx(l['wet'], 2)} t, RESUMEN dice {fx(l['ton_resumen'], 2)} t"))
+    if d.log_en_recepcion:
+        R.issues.append(("media", "Leyes tomadas de la copia del Log en el archivo de recepción",
+                         "Cargue el Log de Muestras actual: la copia puede estar desactualizada"))
 
 
 # ---------------------------------------------------------------- cálculo
@@ -480,6 +787,40 @@ def calcular(d, plan=None):
     R.cobertura = dict(
         turnos_molino=K["n_turnos_molino"], con_ley=K["n_con_ley"],
         rec=K["n_rec"], lotes=len(lotes), lotes_con_ley=len(con_ley))
+    calcular_recepcion(d, R)
     orden = {"alta": 0, "media": 1, "baja": 2}
     R.issues.sort(key=lambda x: orden[x[0]])
     return R
+
+
+def proximo_miercoles(hoy=None):
+    """Miércoles de envío: hoy si es miércoles, si no el próximo."""
+    hoy = hoy or dt.date.today()
+    return hoy + dt.timedelta(days=(2 - hoy.weekday()) % 7)
+
+
+def mensaje_pendientes(R, hoy=None):
+    """Texto semanal para metalurgistas con los pendientes detectados."""
+    hoy = hoy or dt.date.today()
+    corte = R.K.get("ultimo_dia")
+    f = lambda d: d.strftime("%d-%m-%y") if d else "—"
+    nom = {"alta": "ALTA (corregir esta semana)", "media": "MEDIA", "baja": "BAJA (informativo)"}
+    L = [f"Pendientes de datos – Planta Santo Domingo",
+         f"Emitido: {f(hoy)}   |   Corte de datos: {f(corte)}", ""]
+    if not R.issues:
+        L.append("Sin pendientes detectados con los archivos cargados.")
+    n = 0
+    for g in ("alta", "media", "baja"):
+        its = [i for i in R.issues if i[0] == g]
+        if not its:
+            continue
+        L.append(f"— Prioridad {nom[g]} —")
+        for _, tema, det in its:
+            n += 1
+            L.append(f"{n}. {tema}")
+            for ln in str(det).splitlines():
+                L.append(f"   {ln}")
+        L.append("")
+    L += ["Se solicita indicar, por cada punto, responsable y fecha de cierre.",
+          "Los puntos se vuelven a evaluar al cargar los archivos actualizados."]
+    return "\n".join(L)
