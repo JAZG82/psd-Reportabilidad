@@ -8,13 +8,13 @@ import os
 import sys
 import datetime as dt
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, QTimer, QSettings, QUrl
+from PySide6.QtGui import QColor, QFont, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QComboBox,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QDoubleSpinBox, QSpinBox, QMessageBox, QSplitter, QAbstractItemView,
-    QHeaderView, QFrame, QDialog, QPlainTextEdit)
+    QHeaderView, QFrame, QDialog, QPlainTextEdit, QLineEdit)
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -883,6 +883,13 @@ class Ventana(QMainWindow):
         dlg.resize(760, 640)
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel(f"<b>{aviso}</b> El texto es editable antes de copiar o guardar."))
+        cfg = QSettings("LuxMinerals", "PSD_Reportabilidad")
+        fd_ = QHBoxLayout()
+        fd_.addWidget(QLabel("Para:"))
+        le = QLineEdit(str(cfg.value("destinatarios", "")))
+        le.setPlaceholderText("correo1@empresa.cl; correo2@empresa.cl")
+        fd_.addWidget(le, 1)
+        lay.addLayout(fd_)
         ed = QPlainTextEdit(core.mensaje_pendientes(self.R, hoy))
         ed.setFont(QFont("Menlo" if sys.platform == "darwin" else "Consolas", 10))
         lay.addWidget(ed, 1)
@@ -897,9 +904,23 @@ class Ventana(QMainWindow):
                 with open(ruta, "w", encoding="utf-8") as fh:
                     fh.write(ed.toPlainText())
         bg.clicked.connect(guardar)
+        bm = QPushButton("Enviar por correo…")
+        def enviar():
+            from urllib.parse import quote
+            cfg.setValue("destinatarios", le.text().strip())
+            texto = ed.toPlainText()
+            asunto = f"Pendientes de datos PSD – corte {fd(self.R.K.get('ultimo_dia'))}"
+            para = ",".join(x.strip() for x in le.text().replace(";", ",").split(",") if x.strip())
+            QApplication.clipboard().setText(texto)
+            cuerpo = texto
+            if len(quote(texto)) > 1800:  # límite práctico de mailto
+                cuerpo = "(Pegue aquí el listado: Ctrl+V / Cmd+V. Ya está copiado.)"
+            url = f"mailto:{quote(para, safe='@,')}?subject={quote(asunto)}&body={quote(cuerpo)}"
+            QDesktopServices.openUrl(QUrl(url))
+        bm.clicked.connect(enviar)
         bx = QPushButton("Cerrar")
         bx.clicked.connect(dlg.accept)
-        for w in (bc, bg):
+        for w in (bc, bg, bm):
             fila.addWidget(w)
         fila.addStretch(1)
         fila.addWidget(bx)

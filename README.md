@@ -49,3 +49,5 @@ El mes analizado es el del Reporte Jefe de Turno cargado.
 Botón **Pendientes para metalurgistas…** (barra superior): genera, a partir de las alertas detectadas con los archivos cargados, un texto agrupado por prioridad (alta / media / baja), numerado, con fecha de emisión y corte de datos, y la solicitud de responsable y fecha de cierre. Indica si hoy es miércoles o cuál es el próximo envío. El texto es editable; se puede **Copiar** o **Guardar .txt**.
 
 El programa no envía correos: el listado se prepara y se pega en el mail/Teams. Cargue los archivos actualizados antes de generarlo.
+
+**Enviar por correo…**: abre su programa de correo predeterminado (Outlook, Mail, etc.) con asunto y destinatarios ya puestos (campo «Para», se recuerda entre sesiones). Si el listado es largo, el cuerpo queda con un aviso y el texto completo ya está copiado: péguelo con Ctrl+V / Cmd+V. Requiere un cliente de correo configurado en el equipo; el envío final lo hace usted en ese programa.
