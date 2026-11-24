@@ -8,13 +8,13 @@ import os
 import sys
 import datetime as dt
 
-from PySide6.QtCore import Qt, QTimer, QSettings, QUrl
+from PySide6.QtCore import Qt, QTimer, QSettings, QUrl, QDate
 from PySide6.QtGui import QColor, QFont, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QComboBox,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
     QDoubleSpinBox, QSpinBox, QMessageBox, QSplitter, QAbstractItemView,
-    QHeaderView, QFrame, QDialog, QPlainTextEdit, QLineEdit)
+    QHeaderView, QFrame, QDialog, QPlainTextEdit, QLineEdit, QDateEdit, QTabWidget)
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -25,10 +25,16 @@ from matplotlib.backends.backend_qtagg import (
 import psd_core as core
 
 # ------------------------------------------------------------------ estilo
-BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
-MAGENTA, GREEN, VIOLET, RED = "#e87ba4", "#008300", "#6250d6", "#e34948"
-INK, INK2, GRID, SURFACE, PLAN = "#0b0b0b", "#52514e", "#e6e5e1", "#fcfcfb", "#8a8984"
-BLUE_LIGHT = "#b7d3f6"
+# Tema oscuro. Paleta categórica validada contra la superficie (validate_palette, modo dark).
+BLUE, ORANGE, AQUA, YELLOW = "#3a8ae6", "#e8622c", "#17a673", "#f2b632"
+MAGENTA, GREEN, VIOLET, RED = "#d9648f", "#2fbf71", "#7a68e8", "#ef5350"
+INK, INK2, GRID, SURFACE, PLAN = "#f2f2f0", "#c9c8c3", "#3d3d3a", "#1a1a19", "#a8a7a2"
+BLUE_LIGHT = "#8db8f0"
+# estados (fondo, letra) — semáforo único del programa
+ESTADO_ALTA = ("#c62828", "#ffeb3b")    # rojo con letras amarillas
+ESTADO_MEDIA = ("#fdd835", "#000000")   # amarillo con letras negras
+ESTADO_CERRADO = ("#ffffff", "#000000") # blanco con letras negras
+FONDO_FILA = {"#fde8d8": ESTADO_ALTA, "#fff3cf": ESTADO_MEDIA}
 # entidad -> color fijo en toda la aplicación
 C_CAB, C_CONC, C_REL, C_REC = BLUE, ORANGE, AQUA, VIOLET
 C_TA, C_TB = BLUE, ORANGE
@@ -67,7 +73,7 @@ class Hover:
         self.pts = [p for p in pts if p[1] is not None]
         self.ann = ax.annotate(
             "", xy=(0, 0), xytext=(12, 12), textcoords="offset points", fontsize=8,
-            bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#b8b7b0"), zorder=20)
+            bbox=dict(boxstyle="round,pad=0.35", fc="#2b2b29", ec="#6b6a65"), zorder=20)
         self.ann.set_visible(False)
         canvas.mpl_connect("motion_notify_event", self.move)
 
@@ -182,7 +188,9 @@ class Pagina(QWidget):
                 it = QTableWidgetItem(v if isinstance(v, str) else str(v))
                 it.setTextAlignment((Qt.AlignRight if j > 0 and _es_num(v) else Qt.AlignLeft) | Qt.AlignVCenter)
                 if colores and colores[i]:
-                    it.setBackground(QColor(colores[i]))
+                    bg, fg = FONDO_FILA.get(colores[i], (colores[i], "#000000"))
+                    it.setBackground(QColor(bg))
+                    it.setForeground(QColor(fg))
                 t.setItem(i, j, it)
         t.resizeColumnsToContents()
         t.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -242,6 +250,13 @@ class Ventana(QMainWindow):
         self.btn_pend = QPushButton("Pendientes para metalurgistas…")
         self.btn_pend.clicked.connect(self.pendientes)
         top.addWidget(self.btn_pend)
+        b = QPushButton("Carpeta compartida…")
+        b.setToolTip("Carpeta de SharePoint/OneDrive donde se guardan los últimos datos y el seguimiento")
+        b.clicked.connect(self.elegir_carpeta_compartida)
+        top.addWidget(b)
+        b = QPushButton("Cargar datos compartidos")
+        b.clicked.connect(lambda: self.cargar_compartidos(True))
+        top.addWidget(b)
         top.addSpacing(14)
         self.lbl_fuentes = QLabel()
         top.addWidget(self.lbl_fuentes, 1)
@@ -305,6 +320,7 @@ class Ventana(QMainWindow):
         self.lbl_cob.setContentsMargins(6, 6, 6, 6)
         self.p["conc"].layout().insertWidget(0, self.lbl_cob)
         self.refrescar()
+        QTimer.singleShot(600, self._auto_compartidos)
 
     def _ajustar_actual(self):
         pg = self.tabs.currentWidget()
@@ -334,15 +350,87 @@ class Ventana(QMainWindow):
             self.cargar([os.path.join(c, f) for f in sorted(os.listdir(c))
                          if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$")])
 
-    def cargar(self, rutas):
+    # -- Datos compartidos ---------------------------------------------------
+    def carpeta_compartida(self):
+        cfg = self.__dict__.setdefault("_cfg", QSettings("LuxMinerals", "PSD_Reportabilidad", self))
+        return str(cfg.value("carpeta_seguimiento", "")) or None
+
+    def elegir_carpeta_compartida(self):
+        cfg = self.__dict__.setdefault("_cfg", QSettings("LuxMinerals", "PSD_Reportabilidad", self))
+        d = QFileDialog.getExistingDirectory(
+            self, "Carpeta compartida (biblioteca de SharePoint sincronizada con OneDrive)",
+            self.carpeta_compartida() or os.path.expanduser("~"))
+        if not d:
+            return
+        cfg.setValue("carpeta_seguimiento", d)
+        if core.datos_compartidos(d):
+            self.cargar_compartidos(True)
+        else:
+            QMessageBox.information(self, "Carpeta compartida",
+                                    "Carpeta configurada. Aún no hay datos publicados: al cargar planillas "
+                                    "se publicarán aquí para que los demás usuarios las vean.")
+
+    def cargar_compartidos(self, avisar=False):
+        carpeta = self.carpeta_compartida()
+        if not carpeta:
+            if avisar:
+                QMessageBox.information(self, "Datos compartidos",
+                                        "Primero elija la carpeta compartida (botón «Carpeta compartida…»).")
+            return
+        comp = core.datos_compartidos(carpeta)
+        if not comp:
+            if avisar:
+                QMessageBox.information(self, "Datos compartidos", "La carpeta no tiene datos publicados todavía.")
+            return
+        self.cargar([r for r, _ in comp.values()], publicar=False)
+        for tipo, (_, m) in comp.items():  # mostrar el nombre original del archivo
+            if tipo in self.datos.fuentes:
+                self.datos.fuentes[tipo] = f"{m.get('archivo', tipo)} (compartido)"
+        self.refrescar()
+        ult = max(comp.values(), key=lambda x: x[1].get("cargado", ""))[1]
+        c = ult.get("cargado", "")
+        self.statusBar().showMessage(
+            f"Datos compartidos cargados. Última carga: {ult.get('por', '?')} · "
+            f"{c[8:10]}-{c[5:7]}-{c[2:4]} {c[11:16]}")
+
+    def _auto_compartidos(self):
+        if not self.datos.fuentes and self.carpeta_compartida():
+            self.cargar_compartidos(False)
+
+    def publicar(self, cargados):
+        carpeta = self.carpeta_compartida()
+        if not carpeta or not cargados:
+            return
+        pub = []
+        for ruta, tipo in cargados:
+            try:
+                est, ex = core.publicar_datos(carpeta, ruta, tipo)
+                if est == "mas_nuevo":
+                    c = ex.get("cargado", "")
+                    r = QMessageBox.question(
+                        self, "Datos compartidos",
+                        f"Lo compartido de «{core.NOMBRES[tipo]}» es MÁS RECIENTE que este archivo "
+                        f"({ex.get('archivo')}, cargado por {ex.get('por')} el {c[8:10]}-{c[5:7]}-{c[2:4]}).\n\n"
+                        "¿Reemplazar los datos compartidos con el archivo que acaba de abrir?")
+                    if r == QMessageBox.Yes:
+                        est, _ = core.publicar_datos(carpeta, ruta, tipo, forzar=True)
+                if est == "publicado":
+                    pub.append(core.NOMBRES[tipo])
+            except Exception as ex:
+                QMessageBox.warning(self, "Datos compartidos", f"No se pudo publicar {os.path.basename(ruta)}:\n{ex}")
+        if pub:
+            self.statusBar().showMessage("Publicado en la carpeta compartida: " + ", ".join(pub))
+
+    def cargar(self, rutas, publicar=True):
         errores = []
+        cargados = []
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             for r in rutas:
                 if not r.lower().endswith((".xlsx", ".xlsm")):
                     continue
                 try:
-                    self.datos.cargar(r)
+                    cargados.append((r, self.datos.cargar(r)))
                 except Exception as ex:  # archivo no reconocido o dañado
                     errores.append(f"{os.path.basename(r)}: {ex}")
             self.refrescar()
@@ -350,6 +438,8 @@ class Ventana(QMainWindow):
             QApplication.restoreOverrideCursor()
         if errores:
             QMessageBox.warning(self, "Archivos no cargados", "\n".join(errores))
+        if publicar:
+            self.publicar(cargados)
 
     def limpiar(self):
         self.datos = core.Datos()
@@ -367,7 +457,7 @@ class Ventana(QMainWindow):
         d = self.datos
         partes = []
         for k, nombre in core.NOMBRES.items():
-            partes.append(f"<span style='color:{'#0a7a3d' if k in d.fuentes else '#a0a09a'}'>"
+            partes.append(f"<span style='color:{'#4ade80' if k in d.fuentes else '#8a8984'}'>"
                           f"{'●' if k in d.fuentes else '○'} {nombre}</span>")
         self.lbl_fuentes.setText("&nbsp;&nbsp;".join(partes))
         self.R = core.calcular(d, self.plan())
@@ -862,7 +952,7 @@ class Ventana(QMainWindow):
             f"Turnos con molino operando: {c['turnos_molino']} · con ley de cabeza: {c['con_ley']} · "
             f"con recuperación por leyes: {c['rec']}<br>"
             f"Lotes de concentrado: {c['lotes']} · con ley: {c['lotes_con_ley']}<br>"
-            "<span style='color:#52514e'>El programa no estima leyes: lo que falta aparece como pendiente.</span>")
+            "<span style='color:#c9c8c3'>El programa no estima leyes: lo que falta aparece como pendiente.</span>")
         col = {"alta": "#fde8d8", "media": "#fff3cf", "baja": None}
         filas = [({"alta": "Alta", "media": "Media", "baja": "Baja"}[g], tema, det) for g, tema, det in R.issues]
         pg.llenar(["Gravedad", "Tema", "Detalle"], filas, [col[g] for g, _, _ in R.issues])
@@ -871,6 +961,10 @@ class Ventana(QMainWindow):
 
     # -- Exportar ---------------------------------------------------------------
     def pendientes(self):
+        while self._pendientes() == 2:  # 2 = recargar / cambió la carpeta
+            pass
+
+    def _pendientes(self):
         if self.R is None:
             QMessageBox.information(self, "Pendientes", "Cargue archivos primero.")
             return
@@ -878,23 +972,180 @@ class Ventana(QMainWindow):
         prox = core.proximo_miercoles(hoy)
         aviso = ("HOY es miércoles: corresponde enviar el listado." if prox == hoy
                  else f"Próximo envío: miércoles {fd(prox)}.")
+        cfg = self.__dict__.setdefault("_cfg", QSettings("LuxMinerals", "PSD_Reportabilidad", self))
+        carpeta = str(cfg.value("carpeta_seguimiento", "")) or None
+        seg = core.sincronizar_seguimiento(core.cargar_seguimiento(carpeta), self.R.issues)
         dlg = QDialog(self)
         dlg.setWindowTitle("Pendientes para metalurgistas")
-        dlg.resize(760, 640)
+        dlg.resize(1100, 720)
         lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel(f"<b>{aviso}</b> El texto es editable antes de copiar o guardar."))
-        cfg = QSettings("LuxMinerals", "PSD_Reportabilidad")
+        lay.addWidget(QLabel(f"<b>{aviso}</b> Complete estado, responsable y fecha de cierre; "
+                             "se guardan solos y se conservan entre semanas."))
+        fc = QHBoxLayout()
+        lbl_c = QLabel()
+        lbl_c.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl_ult = QLabel()
+        def refrescar_info():
+            m, p = core.ultima_actualizacion(seg)
+            lbl_c.setText("Carpeta del seguimiento: " + (carpeta or core.carpeta_seguimiento_defecto() + "  (solo este computador)"))
+            lbl_ult.setText(f"Última actualización: {p} · {m[8:10]}-{m[5:7]}-{m[2:4]} {m[11:16]}" if m else "Última actualización: —")
+        refrescar_info()
+        bcar = QPushButton("Elegir carpeta compartida…")
+        def elegir():
+            d = QFileDialog.getExistingDirectory(dlg, "Carpeta compartida (p. ej. biblioteca de SharePoint sincronizada con OneDrive)",
+                                                 carpeta or os.path.expanduser("~"))
+            if d:
+                cfg.setValue("carpeta_seguimiento", d)
+                dlg.done(2)
+        bcar.clicked.connect(elegir)
+        brec = QPushButton("Recargar")
+        brec.clicked.connect(lambda: dlg.done(2))
+        fc.addWidget(lbl_c, 1)
+        fc.addWidget(bcar)
+        fc.addWidget(brec)
+        lay.addLayout(fc)
+        lay.addWidget(lbl_ult)
         fd_ = QHBoxLayout()
         fd_.addWidget(QLabel("Para:"))
         le = QLineEdit(str(cfg.value("destinatarios", "")))
         le.setPlaceholderText("correo1@empresa.cl; correo2@empresa.cl")
         fd_.addWidget(le, 1)
         lay.addLayout(fd_)
-        ed = QPlainTextEdit(core.mensaje_pendientes(self.R, hoy))
+
+        tabs = QTabWidget()
+        lay.addWidget(tabs, 1)
+        # --- Pestaña 1: seguimiento -----------------------------------------
+        filas = [(g, t, d) for g, t, d in self.R.issues]
+        abiertos = {t for _, t, _ in filas}
+        cerrados = [t for t, e in seg.items() if t not in abiertos and e.get("modificado")]
+        cerrados.sort(key=lambda t: seg[t]["modificado"], reverse=True)
+        filas += [("", t, "Ya no se detecta con los archivos cargados.") for t in cerrados[:20]]
+        tb = QTableWidget(len(filas), 8)
+        tb.setHorizontalHeaderLabels(["Prioridad", "Pendiente", "Detalle", "Estado",
+                                      "Responsable", "Fecha de cierre", "Comentario", "Modificado"])
+        tb.setWordWrap(True)
+        tb.verticalHeader().setVisible(False)
+        tb.setSelectionMode(QAbstractItemView.NoSelection)
+        hh = tb.horizontalHeader()
+        for c, w in ((0, 80), (1, 200), (3, 110), (4, 140), (5, 130), (6, 180), (7, 120)):
+            tb.setColumnWidth(c, w)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        ed = QPlainTextEdit()
         ed.setFont(QFont("Menlo" if sys.platform == "darwin" else "Consolas", 10))
-        lay.addWidget(ed, 1)
+
+        avisado = []
+        def guardar_seg():
+            try:
+                core.guardar_seguimiento(seg, carpeta)
+            except Exception as ex:
+                if not avisado:
+                    avisado.append(1)
+                    QMessageBox.warning(dlg, "Seguimiento",
+                                        f"No se pudo guardar en la carpeta del seguimiento:\n{ex}")
+            refrescar_info()
+
+        prios = [g for g, _, _ in filas]
+        # (fondo, letra) por prioridad; sin prioridad = ya no se detecta
+        ESTILO = {"alta": ESTADO_ALTA, "media": ESTADO_MEDIA,
+                  "baja": ("#2b2b2b", "#ffffff"), "": ESTADO_CERRADO}
+        tb.setStyleSheet("QTableWidget{background:#2b2b2b;color:#ffffff;gridline-color:#555555;}"
+                         "QHeaderView::section{background:#3a3a3a;color:#ffffff;padding:4px;border:1px solid #555555;}")
+
+        def pintar(r, tema):
+            e = seg[tema]
+            cierre = core._cierre_dt(e.get("cierre", ""))
+            venc = bool(cierre and cierre < hoy and e.get("estado") != "Cerrado")
+            bg, fg = ESTILO[prios[r]]
+            if e.get("estado") == "Cerrado":
+                bg, fg = ESTADO_CERRADO
+            for c in (0, 1, 2):
+                it = tb.item(r, c)
+                if it:
+                    it.setBackground(QColor(bg))
+                    it.setForeground(QColor(fg))
+                    f_ = it.font()
+                    f_.setBold(venc and c == 1)
+                    it.setFont(f_)
+                    if c == 1:
+                        it.setText(("⚠ " if venc else "") + tema)
+            css = (f"QComboBox,QLineEdit,QDateEdit,QLabel{{background:{bg};color:{fg};"
+                   f"border:1px solid #777777;padding:2px;}}"
+                   "QComboBox QAbstractItemView{background:#2b2b2b;color:#ffffff;}"
+                   f"QLineEdit[placeholderText]{{color:{fg};}}")
+            for c in (3, 4, 5, 6, 7):
+                w = tb.cellWidget(r, c)
+                if w:
+                    w.setStyleSheet(css)
+
+        for r, (g, tema, det) in enumerate(filas):
+            e = seg[tema]
+            for c, txt in ((0, {"alta": "Alta", "media": "Media", "baja": "Baja"}.get(g, "—")),
+                           (1, tema), (2, str(det))):
+                it = QTableWidgetItem(txt)
+                it.setFlags(Qt.ItemIsEnabled)
+                tb.setItem(r, c, it)
+            cbe = QComboBox()
+            cbe.addItems(core.ESTADOS)
+            cbe.setCurrentText(e.get("estado", "Pendiente"))
+            tb.setCellWidget(r, 3, cbe)
+            lr = QLineEdit(e.get("responsable", ""))
+            lr.setPlaceholderText("Nombre")
+            tb.setCellWidget(r, 4, lr)
+            de = QDateEdit()
+            de.setCalendarPopup(True)
+            de.setDisplayFormat("dd-MM-yy")
+            de.setMinimumDate(QDate(2000, 1, 1))
+            de.setSpecialValueText("—")
+            cd = core._cierre_dt(e.get("cierre", ""))
+            de.setDate(QDate(cd.year, cd.month, cd.day) if cd else QDate(2000, 1, 1))
+            tb.setCellWidget(r, 5, de)
+            lc = QLineEdit(e.get("comentario", ""))
+            tb.setCellWidget(r, 6, lc)
+            lm = QLabel()
+            tb.setCellWidget(r, 7, lm)
+            def info_mod(tema=tema, lm=lm):
+                e = seg[tema]
+                m = e.get("modificado", "")
+                lm.setText(f"{e.get('por', '')}\n{m[8:10]}-{m[5:7]}-{m[2:4]} {m[11:16]}" if m else "")
+            info_mod()
+
+            def mk(tema=tema, r=r, cbe=cbe, lr=lr, de=de, lc=lc, info_mod=info_mod):
+                def f(*_):
+                    e = seg[tema]
+                    e["estado"] = cbe.currentText()
+                    e["responsable"] = lr.text().strip()
+                    qd = de.date()
+                    e["cierre"] = "" if qd == QDate(2000, 1, 1) else qd.toString("yyyy-MM-dd")
+                    e["comentario"] = lc.text().strip()
+                    e["modificado"] = core.ahora_iso()
+                    e["por"] = core.usuario_actual()
+                    guardar_seg()
+                    info_mod()
+                    pintar(r, tema)
+                    ed.setPlainText(core.mensaje_pendientes(self.R, hoy, seg))
+                return f
+            f = mk()
+            cbe.currentTextChanged.connect(f)
+            lr.editingFinished.connect(f)
+            de.dateChanged.connect(f)
+            lc.editingFinished.connect(f)
+            pintar(r, tema)
+        tb.resizeRowsToContents()
+        for r in range(tb.rowCount()):
+            tb.setRowHeight(r, max(tb.rowHeight(r), 34))
+        tabs.addTab(tb, "Seguimiento")
+        tabs.addTab(ed, "Mensaje")
+
+        def regenerar(i):
+            if i == 1:
+                for w in dlg.findChildren(QLineEdit):
+                    w.editingFinished.emit()  # confirma ediciones en curso
+                ed.setPlainText(core.mensaje_pendientes(self.R, hoy, seg))
+        tabs.currentChanged.connect(regenerar)
+        ed.setPlainText(core.mensaje_pendientes(self.R, hoy, seg))
+
         fila = QHBoxLayout()
-        bc = QPushButton("Copiar al portapapeles")
+        bc = QPushButton("Copiar mensaje")
         bc.clicked.connect(lambda: QApplication.clipboard().setText(ed.toPlainText()))
         bg = QPushButton("Guardar .txt…")
         def guardar():
@@ -904,14 +1155,33 @@ class Ventana(QMainWindow):
                 with open(ruta, "w", encoding="utf-8") as fh:
                     fh.write(ed.toPlainText())
         bg.clicked.connect(guardar)
+        cb_cli = QComboBox()
+        if sys.platform == "darwin":
+            cb_cli.addItem("Outlook", "outlook")
+            cb_cli.addItem("Mail (Mac)", "mail")
+        else:
+            cb_cli.addItem("Outlook", "outlook")
+        cb_cli.addItem("Predeterminado del sistema", "predeterminado")
+        i0 = cb_cli.findData(str(cfg.value("cliente_correo", "outlook")))
+        cb_cli.setCurrentIndex(max(i0, 0))
         bm = QPushButton("Enviar por correo…")
         def enviar():
             from urllib.parse import quote
             cfg.setValue("destinatarios", le.text().strip())
+            ed.setPlainText(core.mensaje_pendientes(self.R, hoy, seg))  # siempre con lo último
             texto = ed.toPlainText()
             asunto = f"Pendientes de datos PSD – corte {fd(self.R.K.get('ultimo_dia'))}"
             para = ",".join(x.strip() for x in le.text().replace(";", ",").split(",") if x.strip())
-            QApplication.clipboard().setText(texto)
+            QApplication.clipboard().setText(texto)  # respaldo
+            cli = cb_cli.currentData()
+            cfg.setValue("cliente_correo", cli)
+            metodo = core.crear_borrador_correo(para, asunto, texto, cli) if cli != "predeterminado" else ""
+            if metodo:
+                return
+            if cli != "predeterminado":
+                QMessageBox.information(
+                    dlg, "Correo", f"No se pudo abrir {cb_cli.currentText()}. "
+                    "Se abrirá el correo predeterminado; el listado queda copiado: péguelo con Ctrl+V / Cmd+V.")
             cuerpo = texto
             if len(quote(texto)) > 1800:  # límite práctico de mailto
                 cuerpo = "(Pegue aquí el listado: Ctrl+V / Cmd+V. Ya está copiado.)"
@@ -920,12 +1190,16 @@ class Ventana(QMainWindow):
         bm.clicked.connect(enviar)
         bx = QPushButton("Cerrar")
         bx.clicked.connect(dlg.accept)
-        for w in (bc, bg, bm):
+        for w in (bc, bg):
             fila.addWidget(w)
+        fila.addWidget(QLabel("Enviar con:"))
+        fila.addWidget(cb_cli)
+        fila.addWidget(bm)
         fila.addStretch(1)
         fila.addWidget(bx)
         lay.addLayout(fila)
         dlg.exec()
+        dlg.deleteLater()
 
     def exportar(self):
         if not self.R:
@@ -955,9 +1229,34 @@ class Ventana(QMainWindow):
         QMessageBox.information(self, "Exportado", f"Informe guardado en:\n{ruta}")
 
 
+def aplicar_tema(app):
+    """Tema oscuro para toda la ventana (Fusion + paleta)."""
+    from PySide6.QtGui import QPalette
+    app.setStyle("Fusion")
+    p = QPalette()
+    c = QColor
+    for rol, col in ((QPalette.Window, "#232322"), (QPalette.WindowText, "#f2f2f0"),
+                     (QPalette.Base, "#1a1a19"), (QPalette.AlternateBase, "#242423"),
+                     (QPalette.Text, "#f2f2f0"), (QPalette.Button, "#2f2f2d"),
+                     (QPalette.ButtonText, "#f2f2f0"), (QPalette.BrightText, "#ffeb3b"),
+                     (QPalette.Highlight, "#3a8ae6"), (QPalette.HighlightedText, "#ffffff"),
+                     (QPalette.ToolTipBase, "#2b2b29"), (QPalette.ToolTipText, "#f2f2f0"),
+                     (QPalette.PlaceholderText, "#8a8984"), (QPalette.Link, "#7fb2f0"),
+                     (QPalette.Light, "#4a4a47"), (QPalette.Midlight, "#3a3a38"),
+                     (QPalette.Dark, "#151514"), (QPalette.Mid, "#2a2a28"), (QPalette.Shadow, "#000000")):
+        p.setColor(rol, c(col))
+    for rol in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        p.setColor(QPalette.Disabled, rol, c("#7a7975"))
+    app.setPalette(p)
+    app.setStyleSheet("QToolTip{background:#2b2b29;color:#f2f2f0;border:1px solid #6b6a65;}"
+                      "QHeaderView::section{background:#2f2f2d;color:#f2f2f0;padding:4px;"
+                      "border:1px solid #3d3d3a;}"
+                      "QTableView{gridline-color:#3d3d3a;}")
+
+
 def main(argv):
     app = QApplication(argv)
-    app.setStyle("Fusion")
+    aplicar_tema(app)
     f = app.font()
     f.setPointSize(10)
     app.setFont(f)

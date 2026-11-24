@@ -799,17 +799,119 @@ def proximo_miercoles(hoy=None):
     return hoy + dt.timedelta(days=(2 - hoy.weekday()) % 7)
 
 
-def mensaje_pendientes(R, hoy=None):
-    """Texto semanal para metalurgistas con los pendientes detectados."""
+ESTADOS = ["Pendiente", "En proceso", "Cerrado"]
+NOMBRE_SEG = "seguimiento_pendientes.json"
+
+
+def carpeta_seguimiento_defecto():
+    import os
+    return os.path.join(os.path.expanduser("~"), ".psd_reportabilidad")
+
+
+def ruta_seguimiento(carpeta=None):
+    import os
+    return os.path.join(carpeta or carpeta_seguimiento_defecto(), NOMBRE_SEG)
+
+
+def usuario_actual():
+    import getpass
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "?"
+
+
+def ahora_iso():
+    return dt.datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+
+def _leer_json(ruta):
+    import json
+    try:
+        with open(ruta, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def fusionar_seguimiento(base, otro, gana_empate=False):
+    """Por cada pendiente gana la ficha con la modificación más reciente."""
+    for t, e in otro.items():
+        if not isinstance(e, dict):
+            continue
+        mo, mb = e.get("modificado", ""), base.get(t, {}).get("modificado", "")
+        if t not in base or mo > mb or (gana_empate and mo == mb):
+            base[t] = dict(e)
+    return base
+
+
+def cargar_seguimiento(carpeta=None):
+    """Lee el archivo común y las copias de conflicto que OneDrive/SharePoint
+    genere (seguimiento_pendientes*.json), y las fusiona."""
+    import glob, os
+    carpeta = carpeta or carpeta_seguimiento_defecto()
+    seg = {}
+    for ruta in sorted(glob.glob(os.path.join(carpeta, "seguimiento_pendientes*.json"))):
+        fusionar_seguimiento(seg, _leer_json(ruta))
+    return seg
+
+
+def guardar_seguimiento(seg, carpeta=None):
+    """Relee el archivo común, fusiona (gana lo más reciente) y escribe.
+    Solo se guardan fichas editadas por una persona. Actualiza `seg` en memoria."""
+    import json, os
+    carpeta = carpeta or carpeta_seguimiento_defecto()
+    os.makedirs(carpeta, exist_ok=True)
+    disco = cargar_seguimiento(carpeta)
+    fusionar_seguimiento(disco, {t: e for t, e in seg.items() if e.get("modificado")}, gana_empate=True)
+    ruta = ruta_seguimiento(carpeta)
+    tmp = ruta + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(disco, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, ruta)
+    for t, e in disco.items():
+        seg[t] = e
+    return seg
+
+
+def sincronizar_seguimiento(seg, issues):
+    """Agrega en memoria fichas por defecto a los pendientes nuevos (no se guardan
+    hasta que alguien las edita)."""
+    for _, t, _ in issues:
+        seg.setdefault(t, {"estado": "Pendiente", "responsable": "", "cierre": "",
+                           "comentario": "", "modificado": "", "por": ""})
+    return seg
+
+
+def ultima_actualizacion(seg):
+    """(fecha-hora, usuario) de la última modificación hecha por alguien."""
+    mod = [(e["modificado"], e.get("por", "")) for e in seg.values() if e.get("modificado")]
+    return max(mod) if mod else ("", "")
+
+
+def _f(d):
+    return d.strftime("%d-%m-%y") if d else "—"
+
+
+def _cierre_dt(txt):
+    try:
+        return dt.date.fromisoformat(txt) if txt else None
+    except ValueError:
+        return None
+
+
+def mensaje_pendientes(R, hoy=None, seg=None):
+    """Texto semanal para metalurgistas con pendientes, estado, responsable y cierre."""
     hoy = hoy or dt.date.today()
+    seg = seg or {}
     corte = R.K.get("ultimo_dia")
-    f = lambda d: d.strftime("%d-%m-%y") if d else "—"
     nom = {"alta": "ALTA (corregir esta semana)", "media": "MEDIA", "baja": "BAJA (informativo)"}
-    L = [f"Pendientes de datos – Planta Santo Domingo",
-         f"Emitido: {f(hoy)}   |   Corte de datos: {f(corte)}", ""]
+    L = ["Pendientes de datos – Planta Santo Domingo",
+         f"Emitido: {_f(hoy)}   |   Corte de datos: {_f(corte)}", ""]
     if not R.issues:
         L.append("Sin pendientes detectados con los archivos cargados.")
-    n = 0
+    n = faltan = vencidos = 0
     for g in ("alta", "media", "baja"):
         its = [i for i in R.issues if i[0] == g]
         if not its:
@@ -817,10 +919,169 @@ def mensaje_pendientes(R, hoy=None):
         L.append(f"— Prioridad {nom[g]} —")
         for _, tema, det in its:
             n += 1
+            e = seg.get(tema, {})
+            cierre = _cierre_dt(e.get("cierre", ""))
+            venc = bool(cierre and cierre < hoy and e.get("estado") != "Cerrado")
+            vencidos += venc
+            if not e.get("responsable") or not cierre:
+                faltan += 1
             L.append(f"{n}. {tema}")
             for ln in str(det).splitlines():
                 L.append(f"   {ln}")
+            L.append(f"   Estado: {e.get('estado', 'Pendiente')}   |   Responsable: {e.get('responsable') or '—'}"
+                     f"   |   Cierre: {_f(cierre)}{'  (VENCIDO)' if venc else ''}")
+            if e.get("comentario"):
+                L.append(f"   Comentario: {e['comentario']}")
         L.append("")
-    L += ["Se solicita indicar, por cada punto, responsable y fecha de cierre.",
-          "Los puntos se vuelven a evaluar al cargar los archivos actualizados."]
+    detectados = {i[1] for i in R.issues}
+    cerr = [(t, e) for t, e in seg.items()
+            if t not in detectados and e.get("modificado") and e.get("estado") == "Cerrado"
+            and (hoy - dt.date.fromisoformat(e["modificado"][:10])).days <= 14]
+    sin_det = [(t, e) for t, e in seg.items()
+               if t not in detectados and e.get("modificado") and e.get("estado") != "Cerrado"]
+    if sin_det:
+        L.append("— Dejaron de detectarse en los datos (confirmar cierre) —")
+        for t, e in sin_det:
+            L.append(f"• {t}  (estado: {e.get('estado')}; responsable: {e.get('responsable') or '—'})")
+        L.append("")
+    if cerr:
+        L.append("— Cerrados en los últimos 14 días —")
+        for t, e in cerr:
+            L.append(f"• {t}  (cerrado el {e['modificado'][8:10]}-{e['modificado'][5:7]}-{e['modificado'][2:4]}; "
+                     f"responsable: {e.get('responsable') or '—'})")
+        L.append("")
+    if n:
+        L.append(f"Resumen: {n} abiertos, {vencidos} vencidos, {faltan} sin responsable o fecha de cierre.")
+    if faltan:
+        L.append("Se solicita indicar responsable y fecha de cierre en los puntos que no los tienen.")
+    L.append("Los puntos se vuelven a evaluar al cargar los archivos actualizados.")
     return "\n".join(L)
+
+
+# ---------------------------------------------------------------------------
+# Envío por correo: crea el borrador con el listado COMPLETO en el cuerpo
+# ---------------------------------------------------------------------------
+def _html_cuerpo(txt):
+    import html
+    out = []
+    for ln in txt.split("\n"):
+        e = html.escape(ln)
+        n = len(e) - len(e.lstrip(" "))
+        out.append("&nbsp;" * n + e[n:])
+    return "<div style=\"font-family:Menlo,Consolas,monospace;font-size:12px\">" + "<br>".join(out) + "</div>"
+
+
+_AS_OUTLOOK = '''on run argv
+  set AppleScript's text item delimiters to ","
+  set addrs to text items of (item 3 of argv)
+  set AppleScript's text item delimiters to ""
+  tell application "Microsoft Outlook"
+    set m to make new outgoing message with properties {subject:(item 1 of argv), content:(item 2 of argv)}
+    repeat with a in addrs
+      if (a as text) is not "" then make new recipient at m with properties {email address:{address:(a as text)}}
+    end repeat
+    open m
+    activate
+  end tell
+end run'''
+
+_AS_MAIL = '''on run argv
+  set AppleScript's text item delimiters to ","
+  set addrs to text items of (item 3 of argv)
+  set AppleScript's text item delimiters to ""
+  tell application "Mail"
+    set m to make new outgoing message with properties {subject:(item 1 of argv), content:(item 2 of argv), visible:true}
+    repeat with a in addrs
+      if (a as text) is not "" then
+        tell m to make new to recipient at end of to recipients with properties {address:(a as text)}
+      end if
+    end repeat
+    activate
+  end tell
+end run'''
+
+_PS_OUTLOOK = ('$o = New-Object -ComObject Outlook.Application; $m = $o.CreateItem(0); '
+               '$m.Subject = $env:PSD_ASUNTO; $m.To = $env:PSD_PARA; $m.Body = $env:PSD_CUERPO; $m.Display()')
+
+
+def crear_borrador_correo(para, asunto, cuerpo, cliente="auto"):
+    """Abre un correo nuevo con el texto completo en el cuerpo.
+    cliente: auto | outlook | mail | predeterminado (este último no intenta nada aquí).
+    Devuelve el método usado: 'outlook', 'mail', 'outlook-win' o '' si no se pudo
+    (en ese caso el llamador usa mailto + portapapeles)."""
+    import os, subprocess, sys
+    dest = ",".join(x.strip() for x in para.replace(";", ",").split(",") if x.strip())
+    try:
+        if sys.platform == "darwin":
+            if cliente in ("auto", "outlook") and os.path.isdir("/Applications/Microsoft Outlook.app"):
+                r = subprocess.run(["osascript", "-e", _AS_OUTLOOK, asunto, _html_cuerpo(cuerpo), dest],
+                                   capture_output=True, timeout=40)
+                if r.returncode == 0:
+                    return "outlook"
+            if cliente in ("auto", "mail"):
+                r = subprocess.run(["osascript", "-e", _AS_MAIL, asunto, cuerpo, dest],
+                                   capture_output=True, timeout=40)
+                if r.returncode == 0:
+                    return "mail"
+        elif sys.platform.startswith("win") and cliente in ("auto", "outlook"):
+            env = dict(os.environ, PSD_ASUNTO=asunto, PSD_PARA=dest.replace(",", ";"), PSD_CUERPO=cuerpo)
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", _PS_OUTLOOK],
+                               env=env, capture_output=True, timeout=40)
+            if r.returncode == 0:
+                return "outlook-win"
+    except Exception:
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Datos compartidos: última versión de cada planilla en la carpeta común
+# ---------------------------------------------------------------------------
+def carpeta_datos(carpeta):
+    import os
+    return os.path.join(carpeta, "datos")
+
+
+def leer_meta_datos(carpeta):
+    import os
+    return _leer_json(os.path.join(carpeta_datos(carpeta), "meta.json"))
+
+
+def datos_compartidos(carpeta):
+    """{tipo: (ruta_xlsx, meta)} de lo publicado en la carpeta común."""
+    import os
+    meta = leer_meta_datos(carpeta)
+    out = {}
+    for tipo, m in meta.items():
+        r = os.path.join(carpeta_datos(carpeta), f"{tipo}.xlsx")
+        if os.path.isfile(r) and tipo in NOMBRES:
+            out[tipo] = (r, m)
+    return out
+
+
+def publicar_datos(carpeta, ruta, tipo, forzar=False):
+    """Copia la planilla a la carpeta común. Devuelve (estado, meta_existente) con
+    estado: 'publicado' | 'igual' (ya estaba esa misma versión) | 'mas_nuevo'
+    (lo compartido es más reciente que el archivo local y no se forzó)."""
+    import os, shutil, json
+    d = carpeta_datos(carpeta)
+    os.makedirs(d, exist_ok=True)
+    mt = os.path.getmtime(ruta)
+    meta = leer_meta_datos(carpeta)
+    ex = meta.get(tipo)
+    if ex and abs(ex.get("mtime", 0) - mt) < 1 and ex.get("tam") == os.path.getsize(ruta):
+        return "igual", ex
+    if ex and ex.get("mtime", 0) > mt + 1 and not forzar:
+        return "mas_nuevo", ex
+    dest = os.path.join(d, f"{tipo}.xlsx")
+    tmp = dest + ".tmp"
+    shutil.copyfile(ruta, tmp)
+    os.replace(tmp, dest)
+    meta = leer_meta_datos(carpeta)  # releer por si otro publicó otro tipo en el intervalo
+    meta[tipo] = {"archivo": os.path.basename(ruta), "por": usuario_actual(), "cargado": ahora_iso(),
+                  "mtime": mt, "tam": os.path.getsize(ruta)}
+    mp = os.path.join(d, "meta.json")
+    with open(mp + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=1)
+    os.replace(mp + ".tmp", mp)
+    return "publicado", None
